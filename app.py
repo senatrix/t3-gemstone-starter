@@ -1,26 +1,198 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import atexit
+import json
+import platform
+import shutil
+import socket
+import subprocess
+import threading
+import time
+
+
+# =========================================================
+# AYARLAR
+# =========================================================
+
+GPIO_LINE = "GPIO4"
+PORT = 8000
+
+
+# =========================================================
+# GPIO DURUMU
+# =========================================================
+
+gpio_lock = threading.Lock()
+gpio_process = None
+led_mode = "released"
+
+
+# =========================================================
+# IP ADRESI
+# =========================================================
+
+def get_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+
+    except Exception:
+        return "Bulunamadi"
+
+    finally:
+        s.close()
+
+
+# =========================================================
+# CPU
+# =========================================================
+
+def read_cpu_times():
+    with open("/proc/stat", "r") as f:
+        values = [int(x) for x in f.readline().split()[1:]]
+
+    idle = values[3] + values[4]
+    total = sum(values)
+
+    return idle, total
+
+
+def get_cpu_usage():
+    idle1, total1 = read_cpu_times()
+
+    time.sleep(0.1)
+
+    idle2, total2 = read_cpu_times()
+
+    idle_delta = idle2 - idle1
+    total_delta = total2 - total1
+
+    if total_delta == 0:
+        return 0.0
+
+    return 100.0 * (1.0 - idle_delta / total_delta)
+
+
+# =========================================================
+# RAM
+# =========================================================
+
+def get_ram():
+    meminfo = {}
+
+    with open("/proc/meminfo", "r") as f:
+        for line in f:
+            key, value = line.split(":", 1)
+            meminfo[key] = int(value.strip().split()[0])
+
+    total = meminfo["MemTotal"]
+    available = meminfo["MemAvailable"]
+    used = total - available
+
+    return {
+        "used_mb": used / 1024,
+        "total_mb": total / 1024,
+        "percent": used / total * 100
+    }
+
+
+# =========================================================
+# DISK
+# =========================================================
+
+def get_disk():
+    total, used, _ = shutil.disk_usage("/")
+
+    gb = 1024 ** 3
+
+    return {
+        "used_gb": used / gb,
+        "total_gb": total / gb,
+        "percent": used / total * 100
+    }
+
+
+# =========================================================
+# SOC SICAKLIGI
+# =========================================================
+
+def get_temperature():
+    path = "/sys/class/thermal/thermal_zone0/temp"
+
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip()) / 1000
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# UPTIME
+# =========================================================
+
+def get_uptime():
+    try:
+        with open("/proc/uptime", "r") as f:
+            seconds = int(float(f.read().split()[0]))
+
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        minutes = (seconds % 3600) // 60
+
+        return {
+            "seconds": seconds,
+            "text": f"{days} gun {hours} saat {minutes} dakika"
+        }
+
+    except Exception:
+        return {
+            "seconds": 0,
+            "text": "Bulunamadi"
+        }
+
+
+# =========================================================
+# WIFI
+# =========================================================
+
+def get_wifi():
+    try:
+        result = subprocess.check_output(
+            [
+                "nmcli",
+                "-g",
+                "GENERAL.CONNECTION",
+                "device",
+                "show",
+                "wlan0"
+            ],
+            text=True,
+            timeout=2
+        ).strip()
+
+        if result and result != "--":
+            return result
+
+        return "Bagli degil"
+
+    except Exception:
+        return "Bulunamadi"
+
+
+# =========================================================
+# ISLETIM SISTEMI
 # =========================================================
 
 def get_os_name():
-
     try:
-
-        with open(
-            "/etc/os-release",
-            "r"
-        ) as f:
-
+        with open("/etc/os-release", "r") as f:
             for line in f:
-
-                if line.startswith(
-                    "PRETTY_NAME="
-                ):
-
+                if line.startswith("PRETTY_NAME="):
                     return (
                         line
-                        .split(
-                            "=",
-                            1
-                        )[1]
+                        .split("=", 1)[1]
                         .strip()
                         .strip('"')
                     )
@@ -32,278 +204,141 @@ def get_os_name():
 
 
 # =========================================================
-# GPIO PROCESS DURDUR
+# GPIO PROCESS YONETIMI
 # =========================================================
 
-def _stop_gpio_process_unlocked():
+def stop_gpio_process_unlocked():
+    global gpio_process
 
-    global _gpio_process
-
-    if (
-        _gpio_process is not None
-        and
-        _gpio_process.poll()
-        is None
-    ):
-
-        _gpio_process.terminate()
+    if gpio_process is not None and gpio_process.poll() is None:
+        gpio_process.terminate()
 
         try:
-
-            _gpio_process.wait(
-                timeout=1
-            )
+            gpio_process.wait(timeout=1)
 
         except subprocess.TimeoutExpired:
+            gpio_process.kill()
+            gpio_process.wait(timeout=1)
 
-            _gpio_process.kill()
+    gpio_process = None
 
-            _gpio_process.wait(
-                timeout=1
-            )
-
-    _gpio_process = None
-
-
-# =========================================================
-# LED MODUNU DEGISTIR
-# =========================================================
 
 def set_led_mode(mode):
-
-    global _gpio_process
-    global _led_mode
+    global gpio_process
+    global led_mode
 
     commands = {
+        "on": [
+            "gpioset",
+            f"{GPIO_LINE}=1"
+        ],
 
-        "on":
-            [
-                "gpioset",
-                f"{GPIO_LINE}=1"
-            ],
+        "off": [
+            "gpioset",
+            f"{GPIO_LINE}=0"
+        ],
 
-        "off":
-            [
-                "gpioset",
-                f"{GPIO_LINE}=0"
-            ],
-
-        "blink":
-            [
-                "gpioset",
-                "-t500ms",
-                f"{GPIO_LINE}=1"
-            ]
+        "blink": [
+            "gpioset",
+            "-t500ms",
+            f"{GPIO_LINE}=1"
+        ]
     }
 
     if mode not in commands:
+        raise ValueError("Gecersiz LED modu")
 
-        raise ValueError(
-            "Gecersiz LED modu"
+    with gpio_lock:
+        stop_gpio_process_unlocked()
+
+        gpio_process = subprocess.Popen(
+            commands[mode],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True
         )
 
-    with _gpio_lock:
-
-        # Önce varsa eski gpioset
-        # prosesini kapat.
-        _stop_gpio_process_unlocked()
-
-        # Yeni gpioset prosesini başlat.
-        _gpio_process = (
-            subprocess.Popen(
-                commands[mode],
-
-                stdout=
-                    subprocess.DEVNULL,
-
-                stderr=
-                    subprocess.PIPE,
-
-                text=True
-            )
-        )
-
-        # gpioset hemen hata verdi mi
-        # kontrol etmek için çok kısa bekle.
         time.sleep(0.08)
 
-        if (
-            _gpio_process.poll()
-            is not None
-        ):
-
+        if gpio_process.poll() is not None:
             error = (
-                _gpio_process
-                .stderr
-                .read()
+                gpio_process.stderr.read()
                 or
                 "gpioset baslatilamadi"
             ).strip()
 
-            _gpio_process = None
+            gpio_process = None
+            led_mode = "error"
 
-            _led_mode = "error"
+            raise RuntimeError(error)
 
-            raise RuntimeError(
-                error
-            )
+        led_mode = mode
 
-        _led_mode = mode
-
-
-# =========================================================
-# LED DURUMU
-# =========================================================
 
 def get_led_state():
+    global led_mode
 
-    global _led_mode
-
-    with _gpio_lock:
-
-        alive = (
-
-            _gpio_process
-            is not None
-
-            and
-
-            _gpio_process.poll()
-            is None
+    with gpio_lock:
+        active = (
+            gpio_process is not None
+            and gpio_process.poll() is None
         )
 
-        if (
-            not alive
-            and
-            _led_mode in
-            (
-                "on",
-                "off",
-                "blink"
-            )
-        ):
-
-            _led_mode = "released"
+        if not active and led_mode in ("on", "off", "blink"):
+            led_mode = "released"
 
         return {
-
-            "mode":
-                _led_mode,
-
-            "active":
-                alive,
-
-            "gpio":
-                GPIO_LINE
+            "mode": led_mode,
+            "active": active,
+            "gpio": GPIO_LINE
         }
 
 
-# =========================================================
-# PROGRAM KAPANIRKEN GPIO'YU SERBEST BIRAK
-# =========================================================
-
 def cleanup_gpio():
+    global led_mode
 
-    global _led_mode
-
-    with _gpio_lock:
-
-        _stop_gpio_process_unlocked()
-
-        _led_mode = "released"
+    with gpio_lock:
+        stop_gpio_process_unlocked()
+        led_mode = "released"
 
 
-atexit.register(
-    cleanup_gpio
-)
+atexit.register(cleanup_gpio)
 
 
 # =========================================================
-# TUM SISTEM VERILERI
+# TUM SISTEM VERILERINI TOPLA
 # =========================================================
 
 def get_system_data():
-
     ram = get_ram()
-
     disk = get_disk()
 
     return {
-
-        "hostname":
-            socket.gethostname(),
-
-        "ip":
-            get_ip(),
+        "hostname": socket.gethostname(),
+        "ip": get_ip(),
 
         "cpu": {
-
-            "usage_percent":
-                round(
-                    get_cpu_usage(),
-                    1
-                )
+            "usage_percent": round(get_cpu_usage(), 1)
         },
 
         "ram": {
-
-            "used_mb":
-                round(
-                    ram["used_mb"],
-                    1
-                ),
-
-            "total_mb":
-                round(
-                    ram["total_mb"],
-                    1
-                ),
-
-            "percent":
-                round(
-                    ram["percent"],
-                    1
-                )
+            "used_mb": round(ram["used_mb"], 1),
+            "total_mb": round(ram["total_mb"], 1),
+            "percent": round(ram["percent"], 1)
         },
 
         "disk": {
-
-            "used_gb":
-                round(
-                    disk["used_gb"],
-                    2
-                ),
-
-            "total_gb":
-                round(
-                    disk["total_gb"],
-                    2
-                ),
-
-            "percent":
-                round(
-                    disk["percent"],
-                    1
-                )
+            "used_gb": round(disk["used_gb"], 2),
+            "total_gb": round(disk["total_gb"], 2),
+            "percent": round(disk["percent"], 1)
         },
 
-        "temperature":
-            get_temperature(),
-
-        "uptime":
-            get_uptime(),
-
-        "wifi":
-            get_wifi(),
-
-        "os":
-            get_os_name(),
-
-        "kernel":
-            platform.release(),
-
-        "led":
-            get_led_state()
+        "temperature": get_temperature(),
+        "uptime": get_uptime(),
+        "wifi": get_wifi(),
+        "os": get_os_name(),
+        "kernel": platform.release(),
+        "led": get_led_state()
     }
 
 
@@ -311,9 +346,8 @@ def get_system_data():
 # WEB ARAYUZU
 # =========================================================
 
-HTML_PAGE = r'''
+HTML_PAGE = r"""
 <!DOCTYPE html>
-
 <html lang="tr">
 
 <head>
@@ -325,9 +359,7 @@ HTML_PAGE = r'''
     content="width=device-width, initial-scale=1.0"
 >
 
-<title>
-Gemstone System Monitor
-</title>
+<title>T3 Gemstone O1 System Monitor</title>
 
 
 <style>
@@ -336,280 +368,126 @@ Gemstone System Monitor
     box-sizing: border-box;
 }
 
-
 body {
-
     margin: 0;
-
-    font-family:
-        Arial,
-        sans-serif;
-
-    background:
-        #0f172a;
-
-    color:
-        white;
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: white;
 }
-
 
 .container {
-
-    width:
-        90%;
-
-    max-width:
-        1100px;
-
-    margin:
-        auto;
-
-    padding:
-        35px;
+    width: 90%;
+    max-width: 1100px;
+    margin: auto;
+    padding: 35px;
 }
-
 
 h1 {
-
-    margin-bottom:
-        5px;
+    margin-bottom: 5px;
 }
-
 
 .subtitle,
 .card-title,
 .chart-title,
 .footer {
-
-    color:
-        #94a3b8;
+    color: #94a3b8;
 }
-
 
 .status {
-
-    margin:
-        15px 0 30px;
-
-    display:
-        inline-block;
-
-    padding:
-        7px 14px;
-
-    border-radius:
-        20px;
-
-    background:
-        #14532d;
+    margin: 15px 0 30px;
+    display: inline-block;
+    padding: 7px 14px;
+    border-radius: 20px;
+    background: #14532d;
 }
-
 
 .grid {
-
-    display:
-        grid;
-
+    display: grid;
     grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(
-                240px,
-                1fr
-            )
-        );
-
-    gap:
-        18px;
+        repeat(auto-fit, minmax(240px, 1fr));
+    gap: 18px;
 }
-
 
 .card,
-.chart-card,
-.control-card {
-
-    background:
-        #1e293b;
-
-    border-radius:
-        14px;
-
-    padding:
-        22px;
+.control-card,
+.chart-card {
+    background: #1e293b;
+    border-radius: 14px;
+    padding: 22px;
 }
-
 
 .value {
-
-    font-size:
-        26px;
-
-    font-weight:
-        bold;
+    font-size: 26px;
+    font-weight: bold;
 }
-
 
 .small-value {
-
-    font-size:
-        18px;
+    font-size: 18px;
 }
-
 
 .progress {
-
-    width:
-        100%;
-
-    height:
-        10px;
-
-    background:
-        #334155;
-
-    border-radius:
-        10px;
-
-    margin-top:
-        15px;
-
-    overflow:
-        hidden;
+    width: 100%;
+    height: 10px;
+    background: #334155;
+    border-radius: 10px;
+    margin-top: 15px;
+    overflow: hidden;
 }
-
 
 .progress-bar {
-
-    height:
-        100%;
-
-    background:
-        #38bdf8;
-
-    width:
-        0%;
-
-    transition:
-        width 0.4s;
+    height: 100%;
+    background: #38bdf8;
+    width: 0%;
+    transition: width 0.4s;
 }
 
-
-/* =====================================================
-   GPIO KONTROL PANELI
-   ===================================================== */
-
-.control-card {
-
-    margin-top:
-        18px;
+.control-card,
+.chart-card {
+    margin-top: 18px;
 }
-
 
 .control-row {
-
-    display:
-        flex;
-
-    flex-wrap:
-        wrap;
-
-    gap:
-        12px;
-
-    margin-top:
-        16px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 16px;
 }
-
 
 button {
-
-    border:
-        0;
-
-    border-radius:
-        10px;
-
-    padding:
-        12px 20px;
-
-    font-size:
-        15px;
-
-    font-weight:
-        bold;
-
-    cursor:
-        pointer;
-
-    background:
-        #334155;
-
-    color:
-        white;
+    border: 0;
+    border-radius: 10px;
+    padding: 12px 20px;
+    font-size: 15px;
+    font-weight: bold;
+    cursor: pointer;
+    background: #334155;
+    color: white;
 }
-
 
 button:hover {
-
-    filter:
-        brightness(1.15);
+    filter: brightness(1.15);
 }
-
 
 button.active {
-
-    outline:
-        2px solid #38bdf8;
-
-    background:
-        #0c4a6e;
+    outline: 2px solid #38bdf8;
+    background: #0c4a6e;
 }
-
 
 #led-message {
-
-    margin-top:
-        15px;
-
-    color:
-        #cbd5e1;
+    margin-top: 15px;
+    color: #cbd5e1;
 }
-
-
-/* =====================================================
-   GRAFIK
-   ===================================================== */
-
-.chart-card {
-
-    margin-top:
-        18px;
-}
-
 
 canvas {
-
-    width:
-        100%;
-
-    height:
-        220px;
-
-    background:
-        #111827;
-
-    border-radius:
-        10px;
+    width: 100%;
+    height: 220px;
+    background: #111827;
+    border-radius: 10px;
 }
 
-
 .footer {
-
-    margin-top:
-        30px;
-
-    font-size:
-        13px;
+    margin-top: 30px;
+    font-size: 13px;
 }
 
 </style>
@@ -619,38 +497,19 @@ canvas {
 
 <body>
 
-
 <div class="container">
 
 
-<h1>
-T3 Gemstone O1
-</h1>
-
+<h1>T3 Gemstone O1</h1>
 
 <div class="subtitle">
-
-Canli Embedded Linux
-Sistem Monitoru + GPIO Kontrol
-
+Canli Embedded Linux Sistem Monitoru + GPIO Kontrol
 </div>
-
 
 <div class="status">
-
-●
-
-<span id="connection">
-API ONLINE
-</span>
-
+● <span id="connection">API ONLINE</span>
 </div>
 
-
-
-<!-- =====================================================
-     SISTEM BILGILERI
-     ===================================================== -->
 
 <div class="grid">
 
@@ -661,12 +520,8 @@ API ONLINE
 CPU Kullanimi
 </div>
 
-<div
-    class="value"
-    id="cpu">
-
+<div class="value" id="cpu">
 -- %
-
 </div>
 
 <div class="progress">
@@ -681,7 +536,6 @@ CPU Kullanimi
 </div>
 
 
-
 <div class="card">
 
 <div class="card-title">
@@ -691,9 +545,7 @@ RAM
 <div
     class="value"
     id="ram-percent">
-
 -- %
-
 </div>
 
 <div id="ram-text">
@@ -712,7 +564,6 @@ RAM
 </div>
 
 
-
 <div class="card">
 
 <div class="card-title">
@@ -722,9 +573,7 @@ Disk
 <div
     class="value"
     id="disk-percent">
-
 -- %
-
 </div>
 
 <div id="disk-text">
@@ -743,7 +592,6 @@ Disk
 </div>
 
 
-
 <div class="card">
 
 <div class="card-title">
@@ -753,13 +601,10 @@ SoC Sicakligi
 <div
     class="value"
     id="temperature">
-
 --
-
 </div>
 
 </div>
-
 
 
 <div class="card">
@@ -771,13 +616,10 @@ IP Adresi
 <div
     class="value small-value"
     id="ip">
-
 --
-
 </div>
 
 </div>
-
 
 
 <div class="card">
@@ -789,13 +631,10 @@ Wi-Fi
 <div
     class="value small-value"
     id="wifi">
-
 --
-
 </div>
 
 </div>
-
 
 
 <div class="card">
@@ -807,13 +646,10 @@ Hostname
 <div
     class="value small-value"
     id="hostname">
-
 --
-
 </div>
 
 </div>
-
 
 
 <div class="card">
@@ -825,13 +661,10 @@ Uptime
 <div
     class="value small-value"
     id="uptime">
-
 --
-
 </div>
 
 </div>
-
 
 
 <div class="card">
@@ -843,13 +676,10 @@ Isletim Sistemi
 <div
     class="value small-value"
     id="os">
-
 --
-
 </div>
 
 </div>
-
 
 
 <div class="card">
@@ -861,9 +691,7 @@ Linux Kernel
 <div
     class="value small-value"
     id="kernel">
-
 --
-
 </div>
 
 </div>
@@ -871,88 +699,54 @@ Linux Kernel
 
 </div>
 
-
-
-<!-- =====================================================
-     GPIO LED KONTROLU
-     ===================================================== -->
 
 <div class="control-card">
 
-
 <div class="card-title">
-
 GPIO4 - Harici LED Kontrolu
-
 </div>
-
 
 <div class="value small-value">
 
 Durum:
-
-<span id="led-state">
---
-</span>
+<span id="led-state">--</span>
 
 </div>
 
 
 <div class="control-row">
 
-
 <button
     id="btn-on"
     onclick="setLed('on')">
-
 LED AC
-
 </button>
-
 
 <button
     id="btn-off"
     onclick="setLed('off')">
-
 LED KAPAT
-
 </button>
-
 
 <button
     id="btn-blink"
     onclick="setLed('blink')">
-
 YANIP SON
-
 </button>
 
-
 </div>
-
 
 <div id="led-message">
-
 GPIO komutu bekleniyor.
+</div>
 
 </div>
 
-
-</div>
-
-
-
-<!-- =====================================================
-     CPU GRAFIGI
-     ===================================================== -->
 
 <div class="chart-card">
 
 <div class="chart-title">
-
-CPU Kullanimi -
-Son 60 Saniye
-
+CPU Kullanimi - Son 60 Saniye
 </div>
 
 <canvas
@@ -964,18 +758,10 @@ Son 60 Saniye
 </div>
 
 
-
-<!-- =====================================================
-     SICAKLIK GRAFIGI
-     ===================================================== -->
-
 <div class="chart-card">
 
 <div class="chart-title">
-
-SoC Sicakligi -
-Son 60 Saniye
-
+SoC Sicakligi - Son 60 Saniye
 </div>
 
 <canvas
@@ -988,36 +774,27 @@ Son 60 Saniye
 
 
 <div class="footer">
-
 Gemstone REST API |
 Veri yenileme: 2 saniye |
 GPIO4: libgpiod
-
 </div>
 
 
 </div>
-
 
 
 <script>
 
 
-// =====================================================
-// GRAFIK HAFIZASI
-// =====================================================
-
 const cpuHistory = [];
-
 const tempHistory = [];
 
 const MAX_POINTS = 30;
 
 
-
-// =====================================================
-// GRAFIK CIZ
-// =====================================================
+// =========================================================
+// GRAFIK
+// =========================================================
 
 function drawChart(
     canvasId,
@@ -1027,20 +804,13 @@ function drawChart(
 ) {
 
     const canvas =
-        document.getElementById(
-            canvasId
-        );
-
+        document.getElementById(canvasId);
 
     const ctx =
-        canvas.getContext(
-            "2d"
-        );
-
+        canvas.getContext("2d");
 
     const width =
         canvas.width;
-
 
     const height =
         canvas.height;
@@ -1057,20 +827,13 @@ function drawChart(
     ctx.strokeStyle =
         "#334155";
 
-
-    ctx.lineWidth =
-        1;
+    ctx.lineWidth = 1;
 
 
-    for (
-        let i = 0;
-        i <= 4;
-        i++
-    ) {
+    for (let i = 0; i <= 4; i++) {
 
         const y =
             (height / 4) * i;
-
 
         ctx.beginPath();
 
@@ -1088,10 +851,7 @@ function drawChart(
     }
 
 
-    if (
-        values.length < 2
-    ) {
-
+    if (values.length < 2) {
         return;
     }
 
@@ -1099,30 +859,21 @@ function drawChart(
     ctx.strokeStyle =
         "#38bdf8";
 
-
-    ctx.lineWidth =
-        3;
-
+    ctx.lineWidth = 3;
 
     ctx.beginPath();
 
 
     values.forEach(
-        (
-            value,
-            index
-        ) => {
+        (value, index) => {
 
             const x =
                 index /
                 (MAX_POINTS - 1) *
                 width;
 
-
             let normalized =
-                value /
-                maxValue;
-
+                value / maxValue;
 
             normalized =
                 Math.max(
@@ -1133,25 +884,20 @@ function drawChart(
                     )
                 );
 
-
             const y =
                 height -
                 normalized *
                 height;
 
 
-            if (
-                index === 0
-            ) {
+            if (index === 0) {
 
                 ctx.moveTo(
                     x,
                     y
                 );
 
-            }
-
-            else {
+            } else {
 
                 ctx.lineTo(
                     x,
@@ -1171,65 +917,51 @@ function drawChart(
         ];
 
 
-    ctx.fillStyle =
-        "white";
-
-
-    ctx.font =
-        "20px Arial";
+    ctx.fillStyle = "white";
+    ctx.font = "20px Arial";
 
 
     ctx.fillText(
-
         last.toFixed(1)
         + " "
         + unit,
-
         15,
         30
-
     );
 }
 
 
+// =========================================================
+// LED BUTON DURUMU
+// =========================================================
 
-// =====================================================
-// LED BUTONLARI
-// =====================================================
-
-function updateLedButtons(
-    mode
-) {
+function updateLedButtons(mode) {
 
     [
         "on",
         "off",
         "blink"
-    ].forEach(
-        name => {
+    ].forEach(name => {
 
-            document
-            .getElementById(
-                "btn-" + name
-            )
-            .classList
-            .toggle(
-                "active",
-                name === mode
-            );
-        }
-    );
+        document
+        .getElementById(
+            "btn-" + name
+        )
+        .classList
+        .toggle(
+            "active",
+            name === mode
+        );
+
+    });
 }
 
 
+// =========================================================
+// LED REST API
+// =========================================================
 
-// =====================================================
-// GPIO REST API'YE KOMUT GONDER
-// =====================================================
-
-async function setLed(
-    mode
-) {
+async function setLed(mode) {
 
     const message =
         document.getElementById(
@@ -1243,17 +975,13 @@ async function setLed(
 
     try {
 
-
         const response =
             await fetch(
                 "/api/led",
                 {
-
-                    method:
-                        "POST",
+                    method: "POST",
 
                     headers: {
-
                         "Content-Type":
                             "application/json"
                     },
@@ -1261,8 +989,7 @@ async function setLed(
                     body:
                         JSON.stringify(
                             {
-                                mode:
-                                    mode
+                                mode: mode
                             }
                         )
                 }
@@ -1273,25 +1000,19 @@ async function setLed(
             await response.json();
 
 
-        if (
-            !response.ok
-        ) {
+        if (!response.ok) {
 
             throw new Error(
-
                 result.error
                 ||
                 "GPIO hatasi"
-
             );
         }
 
 
         message.textContent =
-
             "Basarili: GPIO4 modu = "
-            +
-            result.mode;
+            + result.mode;
 
 
         document
@@ -1299,7 +1020,6 @@ async function setLed(
             "led-state"
         )
         .textContent =
-
             result.mode
             .toUpperCase();
 
@@ -1310,23 +1030,18 @@ async function setLed(
 
     }
 
-    catch (
-        error
-    ) {
+    catch (error) {
 
         message.textContent =
-
             "Hata: "
-            +
-            error.message;
+            + error.message;
     }
 }
 
 
-
-// =====================================================
-// SISTEM VERILERINI API'DEN CEK
-// =====================================================
+// =========================================================
+// SISTEM API
+// =========================================================
 
 async function updateDashboard() {
 
@@ -1336,19 +1051,13 @@ async function updateDashboard() {
             await fetch(
                 "/api/status",
                 {
-                    cache:
-                        "no-store"
+                    cache: "no-store"
                 }
             );
 
 
-        if (
-            !response.ok
-        ) {
-
-            throw new Error(
-                "HTTP hatasi"
-            );
+        if (!response.ok) {
+            throw new Error("HTTP hatasi");
         }
 
 
@@ -1356,29 +1065,20 @@ async function updateDashboard() {
             await response.json();
 
 
-
         // CPU
 
         document
-        .getElementById(
-            "cpu"
-        )
+        .getElementById("cpu")
         .textContent =
-
             data.cpu.usage_percent
-            +
-            " %";
+            + " %";
 
 
         document
-        .getElementById(
-            "cpu-bar"
-        )
+        .getElementById("cpu-bar")
         .style.width =
-
             data.cpu.usage_percent
-            +
-            "%";
+            + "%";
 
 
         cpuHistory.push(
@@ -1390,23 +1090,16 @@ async function updateDashboard() {
             cpuHistory.length >
             MAX_POINTS
         ) {
-
             cpuHistory.shift();
         }
 
 
         drawChart(
-
             "cpu-chart",
-
             cpuHistory,
-
             100,
-
             "%"
-
         );
-
 
 
         // RAM
@@ -1416,10 +1109,8 @@ async function updateDashboard() {
             "ram-percent"
         )
         .textContent =
-
             data.ram.percent
-            +
-            " %";
+            + " %";
 
 
         document
@@ -1427,14 +1118,10 @@ async function updateDashboard() {
             "ram-text"
         )
         .textContent =
-
             data.ram.used_mb
-            +
-            " MB / "
-            +
-            data.ram.total_mb
-            +
-            " MB";
+            + " MB / "
+            + data.ram.total_mb
+            + " MB";
 
 
         document
@@ -1442,11 +1129,8 @@ async function updateDashboard() {
             "ram-bar"
         )
         .style.width =
-
             data.ram.percent
-            +
-            "%";
-
+            + "%";
 
 
         // DISK
@@ -1456,10 +1140,8 @@ async function updateDashboard() {
             "disk-percent"
         )
         .textContent =
-
             data.disk.percent
-            +
-            " %";
+            + " %";
 
 
         document
@@ -1467,14 +1149,10 @@ async function updateDashboard() {
             "disk-text"
         )
         .textContent =
-
             data.disk.used_gb
-            +
-            " GB / "
-            +
-            data.disk.total_gb
-            +
-            " GB";
+            + " GB / "
+            + data.disk.total_gb
+            + " GB";
 
 
         document
@@ -1482,18 +1160,14 @@ async function updateDashboard() {
             "disk-bar"
         )
         .style.width =
-
             data.disk.percent
-            +
-            "%";
-
+            + "%";
 
 
         // SICAKLIK
 
         if (
-            data.temperature
-            === null
+            data.temperature === null
         ) {
 
             document
@@ -1501,23 +1175,18 @@ async function updateDashboard() {
                 "temperature"
             )
             .textContent =
-
                 "Bulunamadi";
 
-        }
-
-        else {
+        } else {
 
             document
             .getElementById(
                 "temperature"
             )
             .textContent =
-
                 data.temperature
                 .toFixed(1)
-                +
-                " °C";
+                + " °C";
 
 
             tempHistory.push(
@@ -1529,85 +1198,58 @@ async function updateDashboard() {
                 tempHistory.length >
                 MAX_POINTS
             ) {
-
                 tempHistory.shift();
             }
 
 
             drawChart(
-
                 "temp-chart",
-
                 tempHistory,
-
                 100,
-
                 "°C"
-
             );
         }
 
 
-
-        // DIGER VERILER
-
         document
-        .getElementById(
-            "ip"
-        )
+        .getElementById("ip")
         .textContent =
             data.ip;
 
 
         document
-        .getElementById(
-            "wifi"
-        )
+        .getElementById("wifi")
         .textContent =
             data.wifi;
 
 
         document
-        .getElementById(
-            "hostname"
-        )
+        .getElementById("hostname")
         .textContent =
             data.hostname;
 
 
         document
-        .getElementById(
-            "uptime"
-        )
+        .getElementById("uptime")
         .textContent =
             data.uptime.text;
 
 
         document
-        .getElementById(
-            "os"
-        )
+        .getElementById("os")
         .textContent =
             data.os;
 
 
         document
-        .getElementById(
-            "kernel"
-        )
+        .getElementById("kernel")
         .textContent =
             data.kernel;
 
 
-
-        // LED DURUMU
-
         document
-        .getElementById(
-            "led-state"
-        )
+        .getElementById("led-state")
         .textContent =
-
             data.led.mode
             .toUpperCase();
 
@@ -1618,229 +1260,130 @@ async function updateDashboard() {
 
 
         document
-        .getElementById(
-            "connection"
-        )
+        .getElementById("connection")
         .textContent =
-
             "API ONLINE";
 
     }
 
-    catch (
-        error
-    ) {
+    catch (error) {
 
         document
-        .getElementById(
-            "connection"
-        )
+        .getElementById("connection")
         .textContent =
-
             "API BAGLANTI HATASI";
 
-
-        console.error(
-            error
-        );
+        console.error(error);
     }
 }
 
 
-
 updateDashboard();
 
-
 setInterval(
-
     updateDashboard,
-
     2000
-
 );
 
 
 </script>
 
-
 </body>
 
 </html>
-'''
+"""
 
 
 # =========================================================
 # HTTP SERVER
 # =========================================================
 
-class PanelHandler(
-    BaseHTTPRequestHandler
-):
+class PanelHandler(BaseHTTPRequestHandler):
 
+    def send_json(self, status_code, data):
+        payload = json.dumps(data).encode("utf-8")
 
-    # -----------------------------------------------------
-    # JSON CEVABI GONDER
-    # -----------------------------------------------------
-
-    def send_json(
-        self,
-        status_code,
-        data
-    ):
-
-        payload = (
-            json.dumps(
-                data
-            )
-            .encode(
-                "utf-8"
-            )
-        )
-
-
-        self.send_response(
-            status_code
-        )
-
+        self.send_response(status_code)
 
         self.send_header(
             "Content-Type",
             "application/json; charset=utf-8"
         )
 
-
         self.send_header(
             "Cache-Control",
             "no-store"
         )
 
-
         self.end_headers()
 
-
-        self.wfile.write(
-            payload
-        )
+        self.wfile.write(payload)
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # GET
-    # -----------------------------------------------------
+    # =====================================================
 
-    def do_GET(
-        self
-    ):
+    def do_GET(self):
 
+        if self.path == "/":
 
-        # ANA SAYFA
-
-        if (
-            self.path == "/"
-        ):
-
-            self.send_response(
-                200
-            )
-
+            self.send_response(200)
 
             self.send_header(
                 "Content-Type",
                 "text/html; charset=utf-8"
             )
 
-
             self.send_header(
                 "Cache-Control",
                 "no-store"
             )
 
-
             self.end_headers()
-
 
             self.wfile.write(
-
-                HTML_PAGE.encode(
-                    "utf-8"
-                )
-
+                HTML_PAGE.encode("utf-8")
             )
 
 
-
-        # SISTEM API
-
-        elif (
-            self.path ==
-            "/api/status"
-        ):
+        elif self.path == "/api/status":
 
             self.send_json(
-
                 200,
-
                 get_system_data()
-
             )
 
 
+        elif self.path == "/favicon.ico":
 
-        # FAVICON
-
-        elif (
-            self.path ==
-            "/favicon.ico"
-        ):
-
-            self.send_response(
-                204
-            )
-
+            self.send_response(204)
             self.end_headers()
 
-
-
-        # BULUNAMADI
 
         else:
 
             self.send_json(
-
                 404,
-
                 {
-                    "error":
-                        "Not Found"
+                    "error": "Not Found"
                 }
-
             )
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # POST
-    # -----------------------------------------------------
+    # =====================================================
 
-    def do_POST(
-        self
-    ):
+    def do_POST(self):
 
-
-        # Sadece LED API'sini kabul et
-
-        if (
-            self.path !=
-            "/api/led"
-        ):
+        if self.path != "/api/led":
 
             self.send_json(
-
                 404,
-
                 {
-                    "error":
-                        "Not Found"
+                    "error": "Not Found"
                 }
-
             )
 
             return
@@ -1848,102 +1391,56 @@ class PanelHandler(
 
         try:
 
-
             length = int(
-
                 self.headers.get(
                     "Content-Length",
                     "0"
                 )
-
             )
 
+            body = self.rfile.read(length)
 
-            body = (
-                self.rfile.read(
-                    length
-                )
+            request_data = json.loads(
+                body.decode("utf-8")
             )
 
+            mode = request_data.get("mode")
 
-            request_data = (
-                json.loads(
-                    body.decode(
-                        "utf-8"
-                    )
-                )
-            )
-
-
-            mode = (
-                request_data.get(
-                    "mode"
-                )
-            )
-
-
-            set_led_mode(
-                mode
-            )
+            set_led_mode(mode)
 
 
             self.send_json(
-
                 200,
-
                 {
-
-                    "ok":
-                        True,
-
-                    "mode":
-                        mode,
-
-                    "gpio":
-                        GPIO_LINE
+                    "ok": True,
+                    "mode": mode,
+                    "gpio": GPIO_LINE
                 }
-
             )
 
 
         except (
             ValueError,
             json.JSONDecodeError
-        ) as e:
-
+        ) as error:
 
             self.send_json(
-
                 400,
-
                 {
-
-                    "ok":
-                        False,
-
-                    "error":
-                        str(e)
+                    "ok": False,
+                    "error": str(error)
                 }
-
             )
 
 
-        except Exception as e:
-
+        except Exception as error:
 
             self.send_json(
-
                 500,
-
                 {
-
-                    "ok":
-                        False,
-
-                    "error":
-                        str(e)
+                    "ok": False,
+                    "error": str(error)
                 }
-
             )
 
 
@@ -1953,42 +1450,33 @@ class PanelHandler(
 
 if __name__ == "__main__":
 
-
-    # Program açıldığında
-    # LED'i güvenli olarak kapalı tut.
-
     try:
-
-        set_led_mode(
-            "off"
-        )
+        set_led_mode("off")
 
         print(
             f"GPIO baslangic durumu: "
             f"{GPIO_LINE}=OFF"
         )
 
-    except Exception as e:
+    except Exception as error:
 
         print(
             "UYARI: GPIO baslatilamadi:",
-            e
+            error
         )
 
 
-    server = (
-        ThreadingHTTPServer(
-            (
-                "0.0.0.0",
-                PORT
-            ),
-            PanelHandler
-        )
+    server = ThreadingHTTPServer(
+        (
+            "0.0.0.0",
+            PORT
+        ),
+        PanelHandler
     )
 
 
     print(
-        "Gemstone V5 baslatildi."
+        "T3 Gemstone Starter Project v1.0"
     )
 
     print(
@@ -2005,19 +1493,13 @@ if __name__ == "__main__":
 
 
     try:
-
         server.serve_forever()
 
-
     except KeyboardInterrupt:
-
         print(
             "\nSunucu kapatiliyor..."
         )
 
-
     finally:
-
         server.server_close()
-
         cleanup_gpio()
