@@ -1,0 +1,15 @@
+[Unit]
+Description=T3 Gemstone Starter Web Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gemstone
+WorkingDirectory=/home/gemstone/gemstone-projects/gemstone-starter
+ExecStart=/usr/bin/python3 /home/gemstone/gemstone-projects/gemstone-starter/app.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
